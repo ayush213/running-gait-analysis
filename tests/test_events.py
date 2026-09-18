@@ -8,6 +8,7 @@ from dataclasses import replace
 import pytest
 
 from gaitlab.core.events import detect_events
+from gaitlab.core.schema import KP_INDEX
 
 
 def test_cadence_matches_synthetic_input(synth):
@@ -50,6 +51,24 @@ def test_faster_cadence_more_strikes(synth):
     assert n_fast > n_slow
 
 
+def test_cadence_with_one_fully_occluded_foot(synth):
+    """One visible foot supplies stride gaps, each representing two steps."""
+    seq = synth("side-left", fps=60, duration=8, cadence=172, seed=1)
+    ankle = KP_INDEX["r_ankle"]
+    frames = []
+    for frame in seq.frames:
+        flat = list(frame)
+        x, _, confidence = flat[ankle]
+        flat[ankle] = (x, float(seq.height - 20), confidence)
+        frames.append(flat)
+
+    ev = detect_events(replace(seq, frames=frames))
+    assert ev.midstances["r"] == []
+    assert ev.midstances["l"]
+    assert ev.cadence_spm == pytest.approx(172, rel=0.05)
+    assert "r" not in ev.stride_time  # no usable value, not a nan at a present key
+
+
 def test_real_timestamps_control_temporal_metrics(synth):
     """Nominal FPS must not override the presentation clock on VFR/dropped-frame input."""
     seq = synth("side-left", fps=60, duration=6, cadence=172, seed=7)
@@ -66,3 +85,42 @@ def test_real_timestamps_control_temporal_metrics(synth):
         assert stretched.contact_time[side] == pytest.approx(
             baseline.contact_time[side] * scale, rel=0.01
         )
+
+
+# --------------------------------------------------------------------- period estimation
+
+
+@pytest.mark.parametrize("cadence", [60, 240])
+@pytest.mark.parametrize("fps", [30, 60, 120])
+def test_cadence_at_the_advertised_search_limits(synth, cadence, fps):
+    ev = detect_events(synth("side-left", fps=fps, duration=8, cadence=cadence, seed=3))
+    assert ev.cadence_spm == pytest.approx(cadence, rel=0.05)
+
+
+def _with_timestamps(seq):
+    return replace(seq, timestamps=[i / seq.fps for i in range(seq.n)])
+
+
+def _drop_frames(seq, keep_one_in, t0, t1):
+    """Drop frames inside [t0, t1) while preserving every surviving frame's real timestamp."""
+    keep = [i for i in range(seq.n)
+            if not (t0 <= seq.timestamps[i] < t1) or i % keep_one_in == 0]
+    return replace(seq,
+                   frames=[seq.frames[i] for i in keep],
+                   timestamps=[seq.timestamps[i] for i in keep])
+
+
+@pytest.mark.parametrize("keep_one_in", [8, 12])
+def test_cadence_survives_frames_dropped_mid_clip(synth, keep_one_in):
+    base = _with_timestamps(synth("side-left", fps=120, duration=12, cadence=172, seed=1))
+    thinned = _drop_frames(base, keep_one_in, 4.0, 8.0)
+    assert thinned.n < base.n, "fixture did not actually drop anything"
+    assert detect_events(thinned).cadence_spm == pytest.approx(172, rel=0.05)
+
+
+def test_robust_period_refuses_a_reference_no_gap_supports():
+    from gaitlab.core.events import _robust_period
+
+    assert math.isnan(_robust_period([0.10, 0.12], 0.50))
+    # Without a reference the median IS an observation, so that fallback still stands.
+    assert _robust_period([0.10, 0.12]) == pytest.approx(0.11)
