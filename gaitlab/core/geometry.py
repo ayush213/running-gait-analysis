@@ -102,6 +102,9 @@ def find_peaks(values: List[float], min_distance: int = 1,
 
     Greedy: keeps the tallest candidate peaks first, then drops any that fall
     within `min_distance` of an already-accepted (taller) peak.
+
+    Here `min_prominence` means height above the signal's global minimum. It is
+    not topographic prominence, which uses each peak's surrounding contour.
     """
     n = len(values)
     if n < 3:
@@ -159,14 +162,8 @@ def resample_uniform(values: List[float], times: List[float], count: int) -> Lis
     return out
 
 
-# How close a shorter lag must come to the best correlation before it is preferred over it.
-#
-# scripts/measure_cadence_groundtruth.py loads this module directly by file path (bypassing
-# gaitlab/__init__.py, which imports the full analysis engine) to reuse normalized_
-# autocorrelation and local_maxima below, so a ground-truth oracle can share the neutral math
-# with production without depending on it: the two keep separate period-picking policies (see
-# dominant_period here vs that script's own dominant_lag), only the arithmetic is shared. A
-# tuning change to this constant is a tuning change for both.
+# Heuristic near-tie ratio for preferring a shorter autocorrelation lag over a harmonic.
+# TODO: calibrate against the real-video corpus.
 SUBHARMONIC_TOLERANCE = 0.85
 
 

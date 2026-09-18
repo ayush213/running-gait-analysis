@@ -1,26 +1,22 @@
 #!/usr/bin/env python3
-"""Measure a clip's true cadence from raw pixels — no pose model, no gaitlab engine.
+"""Measure an independent cadence reference from raw pixels.
 
-This exists so the numbers in tests/data/*.groundtruth.json can be re-derived by anyone,
-rather than being magic constants someone once eyeballed. Cadence regressions in this
-project have historically been "fixed" against intuition; an independent measurement is
-what makes a real-video test trustworthy.
+This lets anyone re-derive the values in `tests/data/*.groundtruth.json` without using a
+pose model or the gait-analysis engine.
 
-The answer comes from COUNTING steps, not from a frequency estimate. Frequency analysis
-cannot distinguish a step rate from twice or half that rate: a signal with energy at f and
-2f fits both readings equally well, and two frequency methods agreeing proves only that
-they chose the same reading. A count of discrete events has no harmonic to lock onto.
+Step counting is the primary estimate. Spectral signals can contain fundamental/harmonic
+ambiguity, so they are cross-checks rather than alternative sources of truth.
 
-Three stages, each able to invalidate the answer:
+Three stages:
 
   1. COUNT — the topmost row of the subject rises and falls once per step. Apexes of that
-     trace are counted; cadence is intervals over elapsed time. This is the measurement.
+     trace are counted; cadence is intervals over elapsed time.
   2. TIMEBASE — a clip shot in slow-motion mode reports a frame rate that is not the rate
      it was captured at, so every per-second figure derived from it is wrong by that
      factor. At a flight apex the body is in free fall, so its vertical acceleration in
      px/frame^2 against a known body scale gives the capture rate independently.
-  3. CROSS-CHECK — leg motion energy and the head trace are read spectrally. These can
-     only raise doubt; they never supply the answer.
+  3. CROSS-CHECK — leg motion energy and the head trace are read spectrally to detect
+     disagreement with the count.
 
     python3 scripts/measure_cadence_groundtruth.py tests/data/male_side.mp4
 
@@ -56,37 +52,30 @@ _spec = importlib.util.spec_from_file_location("_ground_truth_geometry", _geomet
 _geometry = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_geometry)
 
-# Downscale used throughout. Small enough for pure-Python arithmetic over a whole clip,
-# large enough to keep the limbs several pixels wide.
+# Fixed downscale and foreground thresholds for the committed fixed-camera fixtures.
+# TODO: validate sensitivity across lighting, clothing, backgrounds, and resolutions.
 W, H = 90, 160
 LEG_BAND = (100, 160)      # rows spanning hips -> feet at this scale
 
-# Gray levels below the per-pixel bright reference that count as subject rather than scene.
+# Foreground-segmentation heuristics.
 DARK_MARGIN = 35
-# Columns in a row that must be dark before the row counts as occupied, which rejects
-# single-pixel noise and thin scene edges.
 DARK_RUN = 3
 
-# Step periods the search will consider, in seconds. The low end must reach a slow gait
-# seen through a slow-motion container, where the apparent rate is a fraction of the real one.
+# Heuristic plausible step-period range, including slow-motion containers.
 MIN_STEP_S, MAX_STEP_S = 0.20, 2.50
-# Apex spacing floor as a fraction of the measured step period. A real apex sits at 1.0 and
-# any secondary bump well below it.
+# Heuristic apex spacing and free-fall fit windows.
+# TODO: calibrate against reference clips with known capture rates.
 APEX_SPACING_FRAC = 0.6
-# Half-width of the free-fall fit, as a fraction of the step period, and its bounds. The
-# window has to stay near the flight phase: reaching past it into stance flattens the fitted
-# parabola, which understates gravity and overstates the capture rate.
 FIT_WINDOW_FRAC = 0.10
 MIN_FIT_HALF_WINDOW, MAX_FIT_HALF_WINDOW = 2, 5
 # Stature only sets the pixel scale, and the implied rate varies as its square root, so a
 # rough value still separates a 1x timebase from a 2x or 4x one.
 DEFAULT_STATURE_M = 1.70
 GRAVITY = 9.81
-# Relative gap at which the free-fall estimate is reported as contradicting the assumed
-# capture rate. Wide, because the estimate is only precise enough to separate whole factors.
+# Heuristic disagreement thresholds for timebase and spectral cross-checks.
+# TODO: calibrate false-positive and false-negative rates on the validation corpus.
 TIMEBASE_TOLERANCE = 0.5
 
-# Relative gap above which a cross-check is treated as contradicting the count.
 CROSSCHECK_TOLERANCE = 0.08
 
 # Rates cameras actually record at. The free-fall estimate is snapped to the nearest of
@@ -251,12 +240,11 @@ def apex_frames(head: List[float], period_frames: float) -> List[int]:
 
 def implied_capture_fps(head: List[float], apexes: List[int], px_per_m: float,
                         half_window: int) -> float:
-    """Capture rate implied by free fall at each apex, or nan.
+    """Coarse capture-rate consistency estimate from presumed flight apexes, or nan.
 
-    The subject is unsupported at the top of a flight phase, so the apex traces a parabola
-    whose curvature is gravity expressed in px/frame^2. Solving that against a known pixel
-    scale gives the rate the frames were taken at, which a slow-motion container does not
-    report.
+    If a selected apex occurs during flight, its vertical curvature follows gravity in
+    px/frame^2. This can flag an implausible container rate, but cannot establish the
+    recorded frame rate or choose a correction.
     """
     accs: List[float] = []
     for i in apexes:
@@ -371,10 +359,7 @@ def main() -> Optional[int]:
                    min(MAX_FIT_HALF_WINDOW, round(frames_per_step * FIT_WINDOW_FRAC)))
         capture_fps = implied_capture_fps(head, apexes, px_per_m, half)
 
-    # Correcting the timebase automatically would mean choosing a whole factor from an
-    # estimate that cannot reliably separate 3 from 4, and a wrong factor is worse than an
-    # uncorrected container rate. So the caller supplies the capture rate and the estimate
-    # only contradicts it.
+    # This coarse estimate can flag an implausible timebase but cannot safely choose a correction.
     real_fps = args.capture_fps or container_fps
     factor = real_fps / container_fps
     cadence = cadence_container * factor
