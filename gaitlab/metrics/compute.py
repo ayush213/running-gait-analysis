@@ -12,7 +12,7 @@ from typing import Dict, Optional
 
 from . import definitions  # noqa: F401  (import side effect: registers every metric)
 from . import spec as registry
-from .ctx import Ctx, med
+from .ctx import Ctx, median
 from ..core.events import GaitEvents, detect_events
 from ..core.schema import PoseSequence
 
@@ -33,7 +33,7 @@ def _aggregate(mode: str, l, r):
         return max(abs(v) for v in vals)
     if mode == "max":
         return max(vals)
-    return med(vals)  # "median" (default)
+    return median(vals)  # the fallback when no mode string above matches
 
 
 def compute(seq: PoseSequence, events: Optional[GaitEvents] = None,
@@ -85,16 +85,20 @@ def compute(seq: PoseSequence, events: Optional[GaitEvents] = None,
     values["cadence"] = ev.cadence_spm
 
     # frames_of_interest: generic, event-derived anchors the overlay/report point to.
-    foi = res["frames_of_interest"]
+    # A middle stride is as representative of the run as any other and, unlike the
+    # first, is never a partial stride the clip happened to start mid-way through.
+    frames_of_interest = res["frames_of_interest"]
     if view_str == "side":
-        if ev.strikes["l"]:
-            foi["l_strike"] = ev.strikes["l"][0]
+        l_mid, l_strikes, l_toe = ev.midstance("l"), ev.strikes["l"], ev.toeoffs["l"]
+        if l_mid:
+            k = len(l_mid) // 2
+            frames_of_interest["l_midstance"] = l_mid[k]
+            if k < len(l_strikes):
+                frames_of_interest["l_strike"] = l_strikes[k]
+            if k < len(l_toe):
+                frames_of_interest["l_toeoff"] = l_toe[k]
         if ev.strikes["r"]:
-            foi["r_strike"] = ev.strikes["r"][0]
-        if ev.midstance("l"):
-            foi["l_midstance"] = ev.midstance("l")[0]
-        if ev.toeoffs["l"]:
-            foi["l_toeoff"] = ev.toeoffs["l"][0]
+            frames_of_interest["r_strike"] = ev.strikes["r"][len(ev.strikes["r"]) // 2]
         res["series"] = {
             "trunk_lean": ctx.trunk_lean_series(),
             "knee_flexion_l": ctx.knee_flexion_series("l"),
@@ -104,7 +108,8 @@ def compute(seq: PoseSequence, events: Optional[GaitEvents] = None,
     else:
         tilt = ctx.pelvic_tilt_series()
         if any(t == t for t in tilt):
-            foi["max_pelvic_drop"] = max(range(ctx.n), key=lambda i: abs(tilt[i]) if tilt[i] == tilt[i] else -1)
+            frames_of_interest["max_pelvic_drop"] = max(
+                range(ctx.n), key=lambda i: abs(tilt[i]) if tilt[i] == tilt[i] else -1)
         res["series"] = {"pelvic_tilt": tilt, "neck_x": ctx.neck_x_series()}
 
     return res

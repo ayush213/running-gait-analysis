@@ -5,19 +5,19 @@ they live in one file rather than two.
 
 from __future__ import annotations
 
-from ..ctx import med
+from ..ctx import median
 from ..keys import MetricKey
 from ..spec import MetricDef, register
 
 
 def _midstance(ctx, side):
     kflex = ctx.knee_flexion_series(side)
-    return med([kflex[m] for m in ctx.ev.midstance(side)])
+    return median([kflex[m] for m in ctx.ev.midstance(side)])
 
 
 def _contact(ctx, side):
     kflex = ctx.knee_flexion_series(side)
-    return med([kflex[s] for s in ctx.ev.strikes[side]])
+    return median([kflex[s] for s in ctx.ev.strikes[side]])
 
 
 register(MetricDef(
@@ -36,7 +36,7 @@ register(MetricDef(
     per_side_compute=True,
     aggregate="worst_low",
     keypoints=("l_hip", "l_knee", "l_ankle", "r_hip", "r_knee", "r_ankle"),
-    foi="l_midstance",
+    anchor_frame="l_midstance",
     card_per_side_key="knee_flexion_midstance",
     trigger_fn=lambda defn, value, values, targets: (
         ("any", "med") if targets.get(defn.key, defn).status(value) == "bad" else None

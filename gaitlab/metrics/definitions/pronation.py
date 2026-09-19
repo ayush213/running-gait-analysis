@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 
-from ..ctx import med
+from ..ctx import median
 from ..keys import MetricKey
 from ..spec import MetricDef, register
 
@@ -32,7 +32,7 @@ def _compute(ctx, side):
         dy = abs(ankle[1] - heel[1]) + 1e-6
         toward_mid = 1.0 if ankle[0] < mid else -1.0
         vals.append(math.degrees(math.atan2(dx * toward_mid, dy)))
-    return med(vals)
+    return median(vals)
 
 
 register(MetricDef(
@@ -54,7 +54,7 @@ register(MetricDef(
     per_side_compute=True,
     aggregate="worst_high_abs",
     keypoints=("l_heel", "l_ankle", "r_heel", "r_ankle"),
-    foi="max_pelvic_drop",
+    anchor_frame="max_pelvic_drop",
     card_per_side_key="pronation",
     value_confidence_fn=lambda value: "low",
     finding_text={

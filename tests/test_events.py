@@ -124,3 +124,39 @@ def test_robust_period_refuses_a_reference_no_gap_supports():
     assert math.isnan(_robust_period([0.10, 0.12], 0.50))
     # Without a reference the median IS an observation, so that fallback still stands.
     assert _robust_period([0.10, 0.12]) == pytest.approx(0.11)
+
+
+# ----------------------------------------------------------------- boundary stances
+
+
+def test_frames_of_interest_anchor_a_middle_stride_not_the_first(synth):
+    """The overlay's "View frame" link should land somewhere representative of the
+    run, not always ~0.5s in — the first stride of a clip is no more typical than
+    any other."""
+    from gaitlab.core.events import GaitEvents
+    from gaitlab.metrics.compute import compute
+
+    seq = synth("side-left", fps=60, duration=6, cadence=170, seed=1)
+    ev = GaitEvents(
+        strikes={"l": [10, 50, 90, 130], "r": [30, 70, 110]},
+        toeoffs={"l": [20, 60, 100, 140], "r": [40, 80, 120]},
+        midstances={"l": [15, 55, 95, 135], "r": [35, 75, 115]},
+    )
+    frames_of_interest = compute(seq, events=ev)["frames_of_interest"]
+    assert frames_of_interest["l_strike"] == 90  # midstances[len//2] == midstances[2] == 95 -> same k
+    assert frames_of_interest["l_midstance"] == 95
+    assert frames_of_interest["l_toeoff"] == 100
+    assert frames_of_interest["r_strike"] == 70  # strikes["r"][len//2]
+
+
+def test_contact_time_excludes_a_final_stance_the_clip_never_saw_lift_off_from(synth):
+    """The last stride's forward toe-off search is bounded by the recording's own
+    end rather than a real next stride. If it never finds a genuine lift there,
+    the clip ended mid-stance and the fallback-window duration is not a
+    measurement of how long the foot was actually on the ground."""
+    seq = synth("side-left", fps=60, duration=6, cadence=170, seed=4)
+    # Cut just past the first stride's midstance, before the foot ever lifts.
+    trimmed = replace(seq, frames=seq.frames[:13])
+    ev = detect_events(trimmed)
+    assert len(ev.stance["l"]) == 1  # confirms the scenario: one, unresolved, stance
+    assert "l" not in ev.contact_time

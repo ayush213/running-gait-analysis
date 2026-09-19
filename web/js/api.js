@@ -20,3 +20,11 @@ export const {
   listUsers, createUser, updateUser, deleteUser, getActiveUser, setActiveUser,
   listVideos, ingest, setVideoUrl, getVideoUrl,
 } = createRuntimeApi(adapter);
+
+// Client-side extraction diagnostics (timestamp_source, dropped_frame_ratio). Not part
+// of the analysis result: the Python engine echoes back only the pose fields it knows
+// about, so this rides alongside the run rather than through it. Session-local like
+// video URLs above, so it stays outside the runtime adapters too.
+const captureMeta = new Map();
+export const setCaptureMeta = (id, meta) => captureMeta.set(id, meta);
+export const getCaptureMeta = (id) => captureMeta.get(id) || null;

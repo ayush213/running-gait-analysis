@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..ctx import med
+from ..ctx import median
 from ..keys import MetricKey
 from ..spec import MetricDef, register
 
@@ -13,7 +13,7 @@ def _compute(ctx, side):
         ankle = ctx.seq.xy(s, f"{side}_ankle")
         hip = ctx.seq.xy(s, f"{side}_hip")
         vals.append(((ankle[0] - hip[0]) * ctx.facing) / ctx.leg * 100.0)
-    return med(vals)
+    return median(vals)
 
 
 def _trigger(defn, value, values, targets):
@@ -42,7 +42,7 @@ register(MetricDef(
     per_side_compute=True,
     aggregate="worst_high",
     keypoints=("l_hip", "l_ankle", "r_hip", "r_ankle"),
-    foi="l_strike",
+    anchor_frame="l_strike",
     card_per_side_key="overstride",
     trigger_fn=_trigger,
     finding_text={
