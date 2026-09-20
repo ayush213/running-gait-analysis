@@ -50,6 +50,43 @@ def test_leg_length_is_sum_of_thigh_and_shank():
     assert _leg_length(seq) == pytest.approx(200.0, abs=1e-6)
 
 
+@pytest.mark.parametrize("facing_dir,hip_x,ankle_x", [
+    ("left", 500.0, 480.0),    # facing left (facing_sign = -1); ankle ahead by 20px -> positive overstride
+    ("left", 500.0, 520.0),    # facing left; ankle behind by 20px -> negative overstride
+    ("right", 500.0, 520.0),   # facing right (facing_sign = +1); ankle ahead by 20px -> positive overstride
+    ("right", 500.0, 480.0),   # facing right; ankle behind by 20px -> negative overstride
+])
+def test_overstride_analytic(facing_dir, hip_x, ankle_x):
+    from gaitlab.metrics.definitions import overstride as overstride_mod
+
+    # Heel and toe set facing direction: toe ahead of heel in running direction
+    toe_offset = -30.0 if facing_dir == "left" else 30.0
+    view = "side-left" if facing_dir == "left" else "side-right"
+    frames = [{
+        "l_hip": (hip_x, 100.0),
+        "l_knee": (500.0, 200.0),
+        "l_ankle": (ankle_x, 300.0),
+        "l_heel": (500.0, 300.0),
+        "l_big_toe": (500.0 + toe_offset, 300.0),
+    }]
+    seq = pose_from_points(view, frames)
+    ev = GaitEvents(strikes={"l": [0], "r": []})
+    ctx = Ctx(seq, ev, None)
+
+    facing = -1 if facing_dir == "left" else 1
+    thigh = math.hypot(500.0 - hip_x, 200.0 - 100.0)
+    shank = math.hypot(ankle_x - 500.0, 300.0 - 200.0)
+    leg = thigh + shank
+    expected = ((ankle_x - hip_x) * facing) / leg * 100.0
+
+    assert ctx.facing == facing
+    assert overstride_mod._compute(ctx, "l") == pytest.approx(expected, abs=1e-3)
+    if (ankle_x - hip_x) * facing > 0:
+        assert overstride_mod._compute(ctx, "l") > 0  # positive when ahead
+    else:
+        assert overstride_mod._compute(ctx, "l") < 0  # negative when behind
+
+
 # --- analytic-from-parameter: synthetic input we control -------------------
 
 def test_trunk_lean_recovers_synthetic_8deg(synth):

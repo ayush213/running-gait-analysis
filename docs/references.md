@@ -112,6 +112,20 @@ Index  Name            Used?  Notes
 | Altman & Davis 2012 — foot strike classification | https://pubmed.ncbi.nlm.nih.gov/22075193/ | Defines foot-strike angle relative to the ground in the sagittal plane |
 | Crowell & Davis 2011 — shank angle retraining | https://pubmed.ncbi.nlm.nih.gov/20889020/ | Reducing overstride cuts peak tibial acceleration 20% |
 
+### Overstride measurement contract & provenance
+
+- **Formula**: `((ankle_x - hip_x) * facing) / ctx.leg * 100` (`%leg`).
+- **Proximal landmark**: Pose `hip` (joint center). Literature marks greater trochanter; 2D pose estimates the joint center (slightly superior and medial to greater trochanter).
+- **Distal landmark**: Pose `ankle` (lateral malleolus). Headline choice for stability across shoe geometries and pitch angles. (Foot center translates with foot pitch; heel contact is meaningless for forefoot strikers).
+- **Denominator**: `ctx.leg` = median(thigh + shank) in px. Literature (Lieberman) measures trochanter-to-floor (including ankle height ~7–10 cm). `%leg` represents segment-normalized proportion. Alternatively, hip-to-ankle inclination from vertical ($\theta = \text{atan2}(dx, dy)$) is calibration-free and protractor-verifiable on still frames.
+- **Sign convention**: `* ctx.facing` — positive = foot landing ahead of hip (anterior); negative = landing behind hip.
+- **Aggregation**: Per-side median across strike events; bilateral `worst_high` (max of left and right).
+- **Provenance vocabulary**:
+  - `[literature]`: Peer-reviewed research citations.
+  - `[calibrated]`: Validated against ground truth fixtures/video.
+  - `[heuristic]`: Domain-informed engineering convention or rule of thumb.
+  - `[uncalibrated]`: Working assumption requiring future experimental validation.
+
 ---
 
 ## Knee drive & hip extension
