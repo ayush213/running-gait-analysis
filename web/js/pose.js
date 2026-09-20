@@ -1,7 +1,7 @@
 // In-browser BlazePose extraction mapped to the canonical PoseSequence schema.
 // Keep BLAZEPOSE and toCanonical() aligned with extractor/blazepose.py.
 
-import { TASKS_VISION_URL, POSE_MODEL_URL } from "./config.js";
+import { TASKS_VISION_URL, POSE_MODEL_URL, MP4BOX_URL } from "./config.js";
 
 // Canonical keypoint order — MUST match gaitlab/core/schema.py KEYPOINTS exactly.
 export const KEYPOINTS = [
@@ -57,17 +57,55 @@ export function toCanonical(lm, w, h) {
 const ZERO_FRAME = () => KEYPOINTS.map(() => [0.0, 0.0, 0.0]);
 const round3 = (p) => p.map((v) => Math.round(v * 1000) / 1000);
 
+// ISO/IEC 14496-12's tkhd matrix carries a phone's display rotation separately from the
+// coded pixels. A <video> element applies it for free during playback; VideoDecoder does
+// not apply it at all, so a decoder-based path must read and apply it explicitly or hand
+// back sideways-oriented frames.
+//
+// Values are 16.16 fixed-point (row a,b,c,d at indices 0,1,3,4; ISO 14496-12 §8.4.2.2),
+// the same convention CanvasRenderingContext2D.setTransform uses, so the matrix maps
+// directly onto a canvas transform once translated into the positive quadrant. Only the
+// four axis-aligned rotations phones actually emit are handled; an unrecognised
+// transform (shear, perspective, a flip) returns null rather than a guess.
+export function rotationFromMatrix(matrix) {
+  const FIXED = 65536; // 16.16 fixed-point unit
+  const round = (v) => Math.round(v / FIXED);
+  const a = round(matrix[0]);
+  const b = round(matrix[1]);
+  const c = round(matrix[3]);
+  const d = round(matrix[4]);
+  const CASES = {
+    "1,0,0,1": { angle: 0, swapped: false },
+    "0,1,-1,0": { angle: 90, swapped: true },
+    "-1,0,0,-1": { angle: 180, swapped: false },
+    "0,-1,1,0": { angle: 270, swapped: true },
+  };
+  return CASES[`${a},${b},${c},${d}`] || null;
+}
+
+// A canvas transform equivalent to `rot`, for a coded frame of `codedW` x `codedH`,
+// translated so the rotated content lands in the canvas's positive quadrant. Matches
+// CanvasRenderingContext2D.setTransform(a, b, c, d, e, f)'s own argument order.
+export function canvasTransformFor(rot, codedW, codedH) {
+  switch (rot.angle) {
+    case 90: return [0, 1, -1, 0, codedH, 0];
+    case 180: return [-1, 0, 0, -1, codedW, codedH];
+    case 270: return [0, -1, 1, 0, 0, codedW];
+    default: return [1, 0, 0, 1, 0, 0];
+  }
+}
+
 let _landmarkerPromise = null;
 // MediaPipe uses timestamp deltas for smoothing and requires them to increase across the
 // cached landmarker's lifetime. Offset real media time for each extraction run.
 let _mpEpoch = 0;
-async function getLandmarker() {
+async function getLandmarker(delegate = "GPU") {
   if (_landmarkerPromise) return _landmarkerPromise;
   _landmarkerPromise = (async () => {
     const { FilesetResolver, PoseLandmarker } = await import(`${TASKS_VISION_URL}`);
     const fileset = await FilesetResolver.forVisionTasks(`${TASKS_VISION_URL}/wasm`);
     return PoseLandmarker.createFromOptions(fileset, {
-      baseOptions: { modelAssetPath: POSE_MODEL_URL, delegate: "GPU" },
+      baseOptions: { modelAssetPath: POSE_MODEL_URL, delegate },
       runningMode: "VIDEO",
       numPoses: 1,
     });
@@ -222,12 +260,14 @@ export function fpsFromTimestamps(ts) {
   return med > 0 ? 1 / med : 30;
 }
 
-// Extract a pose dict from a video object URL. First collect the presentation-time grid,
-// then seek and run inference without real-time pressure. Preserve that grid as the pose
-// timestamps; browsers without rVFC use a fixed 30 fps grid.
-export async function extract(videoUrl, view, onProgress = () => {}) {
+// Extract a pose dict via requestVideoFrameCallback-driven playback. First collect the
+// presentation-time grid, then seek and run inference without real-time pressure.
+// Preserve that grid as the pose timestamps; browsers without rVFC use a fixed 30 fps
+// grid. This is the fallback used where WebCodecs is unavailable; see extractViaWebCodecs
+// for the primary path and why this one is not used when a demuxer is available.
+async function extractViaPlayback(videoUrl, view, onProgress, delegate) {
   onProgress(0, "Loading pose model…");
-  const [landmarker, video] = await Promise.all([getLandmarker(), loadVideo(videoUrl)]);
+  const [landmarker, video] = await Promise.all([getLandmarker(delegate), loadVideo(videoUrl)]);
   const width = video.videoWidth;
   const height = video.videoHeight;
   const duration = video.duration || 0;
@@ -286,4 +326,215 @@ export async function extract(videoUrl, view, onProgress = () => {}) {
     timestamp_source: timestampSource,
     dropped_frame_ratio: droppedRatio,
   };
+}
+
+// Demux the video's track with mp4box.js: raw samples plus the codec's avcC/hvcC
+// description, which VideoDecoder.configure() requires and a <video> element does not
+// expose. Resolves once every sample the container promised has been delivered, since
+// this build's onFlush callback is not reliably invoked after flush().
+async function demuxVideoTrack(videoUrl) {
+  const mod = await import(MP4BOX_URL);
+  const MP4Box = mod.default || mod;
+  const buf = await (await fetch(videoUrl)).arrayBuffer();
+  buf.fileStart = 0;
+
+  return new Promise((resolve, reject) => {
+    const file = MP4Box.createFile();
+    const collected = [];
+    let track = null;
+    let description = null;
+    file.onError = (e) => reject(new Error(`mp4 demux failed: ${e}`));
+    file.onReady = (info) => {
+      track = info.videoTracks[0];
+      if (!track) { reject(new Error("No video track in file")); return; }
+      const trak = file.getTrackById(track.id);
+      for (const entry of trak.mdia.minf.stbl.stsd.entries) {
+        const box = entry.avcC || entry.hvcC;
+        if (box) {
+          const stream = new MP4Box.DataStream(undefined, 0, MP4Box.DataStream.BIG_ENDIAN);
+          box.write(stream);
+          description = new Uint8Array(stream.buffer, 8); // skip the box header
+        }
+      }
+      if (!description) { reject(new Error("No avcC/hvcC description in track")); return; }
+      file.setExtractionOptions(track.id, null, { nbSamples: track.nb_samples });
+      file.start();
+    };
+    file.onSamples = (id, user, arr) => {
+      for (const s of arr) collected.push(s);
+      if (collected.length >= track.nb_samples) {
+        // codedWidth/Height is the elementary stream's own size, which is what
+        // VideoDecoder needs configured and what a decoded VideoFrame is shaped as.
+        // It is the coded (pre-rotation) size, not necessarily the display size --
+        // rotation is handled separately by the caller via `rotation`.
+        const rotation = rotationFromMatrix(track.matrix);
+        if (!rotation) {
+          // A transform this codebase does not recognise (shear, perspective, a flip)
+          // must not be coerced to identity: that would silently score pixels in the
+          // wrong orientation, which is the exact failure this whole path exists to
+          // prevent. No frame has been decoded yet, so this is safe to reject outright.
+          reject(new Error("Unsupported video orientation (non-axis-aligned display transform)"));
+          return;
+        }
+        resolve({
+          codec: track.codec,
+          codedWidth: track.video.width,
+          codedHeight: track.video.height,
+          rotation,
+          timescale: track.timescale,
+          samples: collected,
+          description,
+        });
+      }
+    };
+    file.appendBuffer(buf);
+    file.flush();
+  });
+}
+
+// Thrown by extractViaWebCodecs. Never caught to retry via the playback path (see
+// extract()) -- `partial` is diagnostic, not a branch point: false means nothing was
+// fed to the landmarker yet (unsupported container/codec, no track, an unrecognised
+// display transform); true means some frames were already decoded and scored before
+// the failure, so the landmarker's cached VIDEO-mode state and _mpEpoch reflect a run
+// that never finished. Either way the caller sees a clear failure rather than a result
+// stitched from two different extraction mechanisms with no signal that happened.
+class ExtractionError extends Error {
+  constructor(message, { partial }) {
+    super(message);
+    this.partial = partial;
+  }
+}
+
+// Extract a pose dict via WebCodecs: demux the container's samples directly and decode
+// them with VideoDecoder, bypassing <video> element playback and
+// requestVideoFrameCallback entirely. On WebKit that presentation pipeline can silently
+// drop a large fraction of a high-frame-rate clip's frames regardless of playback rate,
+// while seeking within the same video remains frame-accurate; decoding demuxed samples
+// sidesteps presentation altogether, so every sample the container declares is decoded.
+async function extractViaWebCodecs(videoUrl, view, onProgress, delegate) {
+  onProgress(0, "Loading pose model…");
+  const [landmarker, track] = await Promise.all([getLandmarker(delegate), demuxVideoTrack(videoUrl)]);
+  const { codedWidth, codedHeight, rotation, timescale, samples, description } = track;
+  // The canonical pose is always in display orientation -- toCanonical()'s (w, h) scale
+  // and the mapping every downstream metric assumes must match what a person watching
+  // the clip actually sees, the same contract the <video>-based path gets for free.
+  const width = rotation.swapped ? codedHeight : codedWidth;
+  const height = rotation.swapped ? codedWidth : codedHeight;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(...canvasTransformFor(rotation, codedWidth, codedHeight));
+
+  const frames = [];
+  const timestamps = [];
+  const epoch = _mpEpoch;
+  let lastMs = -1;
+  let lastTs = -Infinity;
+  const total = samples.length;
+  let processed = 0;
+  let failure = null;
+
+  onProgress(0, "Decoding frames…");
+  try {
+    await new Promise((resolve, reject) => {
+      const settle = (err) => {
+        if (failure) return; // first failure wins; later callbacks are no-ops
+        failure = err;
+        try { decoder.close(); } catch { /* already closing */ }
+        reject(err);
+      };
+      const decoder = new VideoDecoder({
+        output: (frame) => {
+          if (failure) { frame.close(); return; }
+          const tSec = frame.timestamp / 1e6;
+          // The spec does not guarantee decode order matches presentation order for
+          // every codec. Continuing past a reordered frame would corrupt event timing
+          // silently -- exactly the failure mode this path exists to remove -- so it is
+          // treated as a hard failure rather than a count and a warning.
+          if (tSec < lastTs) {
+            frame.close();
+            settle(new ExtractionError(
+              "decoded frame arrived out of presentation order", { partial: processed > 0 }
+            ));
+            return;
+          }
+          lastTs = tSec;
+
+          ctx.drawImage(frame, 0, 0, codedWidth, codedHeight);
+          frame.close();
+
+          let ms = epoch + Math.round(tSec * 1000);
+          if (ms <= lastMs) ms = lastMs + 1;
+          lastMs = ms;
+          const res = landmarker.detectForVideo(canvas, ms);
+          const lm = res.landmarks && res.landmarks[0];
+          frames.push(lm ? toCanonical(lm, width, height).map(round3) : ZERO_FRAME());
+          timestamps.push(Math.round(tSec * 10000) / 10000);
+          processed++;
+          onProgress(processed / total, `Extracting pose… ${frames.length} frames`);
+        },
+        error: (e) => settle(new ExtractionError(
+          e && e.message || String(e), { partial: processed > 0 }
+        )),
+      });
+      try {
+        decoder.configure({ codec: track.codec, codedWidth, codedHeight, description });
+      } catch (e) {
+        settle(new ExtractionError(`unsupported codec: ${e.message || e}`, { partial: false }));
+        return;
+      }
+      for (const s of samples) {
+        decoder.decode(new EncodedVideoChunk({
+          type: s.is_sync ? "key" : "delta",
+          timestamp: Math.round((s.cts * 1e6) / timescale),
+          duration: Math.round((s.duration * 1e6) / timescale),
+          data: s.data,
+        }));
+      }
+      decoder.flush().then(() => { decoder.close(); resolve(); }, settle);
+    });
+  } finally {
+    // Advance the shared landmarker clock past whatever this run fed it, success or
+    // not, so a retry (via either path) never reuses timestamps this run already used.
+    if (lastMs >= 0) _mpEpoch = Math.max(_mpEpoch, lastMs + 1000);
+  }
+
+  onProgress(1, `Extracted ${frames.length} frames`);
+  return {
+    schema: "gaitlab.pose/v1",
+    source: "mediapipe-blazepose",
+    view,
+    fps: fpsFromTimestamps(timestamps),
+    width,
+    height,
+    keypoint_names: KEYPOINTS.slice(),
+    frames,
+    timestamps,
+    timestamp_source: "decoded",
+    // The container's own declared sample count is the completeness ground truth here,
+    // independent of what decoding actually produced -- unlike the playback path, where
+    // nothing independent of the collected grid itself was available.
+    dropped_frame_ratio: total ? 1 - processed / total : null,
+    source_interval: samples.length > 1
+      ? (samples[samples.length - 1].cts - samples[0].cts) / timescale / (samples.length - 1)
+      : null,
+  };
+}
+
+function webCodecsAvailable() {
+  return typeof VideoDecoder !== "undefined" && typeof EncodedVideoChunk !== "undefined";
+}
+
+// Extract a pose dict from a video object URL. Prefers WebCodecs, which decodes every
+// frame the container declares regardless of engine. The playback path is used only
+// when WebCodecs itself is unsupported by the browser, never as a recovery from a
+// WebCodecs failure on a browser that does support it: a file the primary path cannot
+// handle is not evidence the unreliable fallback would have handled it correctly, so
+// such a file surfaces as a clear extraction failure instead of a silent retry.
+export async function extract(videoUrl, view, onProgress = () => {}, delegate = "GPU") {
+  if (!webCodecsAvailable()) return extractViaPlayback(videoUrl, view, onProgress, delegate);
+  return extractViaWebCodecs(videoUrl, view, onProgress, delegate);
 }

@@ -38,3 +38,41 @@ jobs:
           node-version: "20"
       - run: npm install
       - run: npm test  # pretest builds web/py/gaitlab.zip; runs vitest + parity
+
+  # web/js/pose.js's primary extraction path is reachable only from a real browser, and
+  # the `test` job above never installs one -- tests/browser/ skips silently there via
+  # pytest.importorskip. Real Chrome + Playwright's WebKit, real decode, real MediaPipe
+  # inference. Headed (not --headless), matching local runs, since frame presentation is
+  # what these tests measure; xvfb-run supplies the display a CI runner lacks. Safari
+  # needs safaridriver and a macOS runner, so it stays a manual, documented local check
+  # (see tests/browser/drivers.py) rather than a CI job.
+  test-browser:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [chrome, webkit]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      - run: pip install playwright
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ matrix.engine }}-${{ hashFiles('requirements-dev.txt') }}
+      - run: playwright install --with-deps ${{ matrix.engine }}
+      # xvfb-run is not guaranteed present on the runner image; installed explicitly
+      # rather than assumed, since tests run headed to match local runs.
+      - run: sudo apt-get update && sudo apt-get install -y xvfb
+      - name: Run browser extraction tests
+        run: xvfb-run -a pytest tests/browser -s
+        env:
+          GAITLAB_BROWSER: ${{ matrix.engine }}
+          # test_repeated_extractions_agree skips at the default of 1. Two runs on the
+          # WebKit leg is enough to catch a run-to-run cadence regression there without
+          # doubling every engine's CI time for no added signal on Chrome.
+          GAITLAB_BROWSER_RUNS: ${{ matrix.engine == 'webkit' && '2' || '1' }}
